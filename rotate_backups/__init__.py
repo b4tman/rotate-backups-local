@@ -108,6 +108,8 @@ A compiled regular expression object used to match timestamps encoded in
 filenames.
 """
 
+def is_windows_location(value):
+    return re.fullmatch("^[A-Z]:.*$", value) is not None
 
 def coerce_location(value, **options):
     """
@@ -124,16 +126,19 @@ def coerce_location(value, **options):
         if not isinstance(value, string_types):
             msg = "Expected Location object or string, got %s instead!"
             raise ValueError(msg % type(value))
-        # Try to parse a remote location.
-        ssh_alias, _, directory = value.partition(':')
-        if ssh_alias and directory and '/' not in ssh_alias:
-            options['ssh_alias'] = ssh_alias
-        else:
+        if is_windows_location(value):
             directory = value
+        else:
+            # Try to parse a remote location.
+            ssh_alias, _, directory = value.partition(':')
+            if ssh_alias and directory and '/' not in ssh_alias:
+                options['ssh_alias'] = ssh_alias
+            else:
+                directory = parse_path(value)
         # Create the location object.
         value = Location(
             context=create_context(**options),
-            directory=parse_path(directory),
+            directory=directory,
         )
     return value
 
@@ -501,8 +506,13 @@ class RotateBackups(PropertyManager):
         """
         timer = Timer()
         pool = CommandPool(concurrency=10)
+        local_files_to_remove = []
         logger.info("Scanning %s ..", pluralize(len(locations), "backup location"))
         for location in locations:
+            if not location.is_remote:
+                files = self.rotate_backups(location, prepare=True, **kw)
+                local_files_to_remove.extend(files)
+                continue
             for cmd in self.rotate_backups(location, prepare=True, **kw):
                 pool.add(cmd)
         if pool.num_commands > 0:
@@ -510,6 +520,17 @@ class RotateBackups(PropertyManager):
             logger.info("Preparing to rotate %s (in parallel) ..", backups)
             pool.run()
             logger.info("Successfully rotated %s in %s.", backups, timer)
+        # remove local files
+        # TODO: thread pool?
+        local_files_count = len(local_files_to_remove)
+        if local_files_count > 0:
+            backups = pluralize(local_files_count, "backup")
+            logger.info("Preparing to rotate (local) %s ..", backups)
+            for filename in local_files_to_remove:
+                os.remove(filename)
+            logger.info("Successfully rotated (local) %s in %s.", backups, timer)
+            
+            
 
     def rotate_backups(self, location, load_config=True, prepare=False):
         """
@@ -524,7 +545,7 @@ class RotateBackups(PropertyManager):
         :param prepare: If this is :data:`True` (not the default) then
                         :func:`rotate_backups()` will prepare the required
                         rotation commands without running them.
-        :returns: A list with the rotation commands
+        :returns: A list with the rotation commands or local filenames
                   (:class:`~executor.ExternalCommand` objects).
         :raises: :exc:`~exceptions.ValueError` when the given location doesn't
                  exist, isn't readable or isn't writable. The third check is
@@ -540,6 +561,7 @@ class RotateBackups(PropertyManager):
         :func:`find_preservation_criteria()` methods.
         """
         rotation_commands = []
+        files_to_remove = []
         location = coerce_location(location)
         # Load configuration overrides by user?
         if load_config:
@@ -577,6 +599,7 @@ class RotateBackups(PropertyManager):
             else:
                 logger.info("Deleting %s ..", friendly_name)
                 if not self.dry_run:
+                    files_to_remove.append(backup.pathname)
                     # Copy the list with the (possibly user defined) removal command.
                     removal_command = list(self.removal_command)
                     # Add the pathname of the backup as the final argument.
@@ -590,11 +613,14 @@ class RotateBackups(PropertyManager):
                     rotation_commands.append(command)
                     if not prepare:
                         timer = Timer()
-                        command.wait()
+                        if location.is_remote:
+                            command.wait()
+                        else:
+                            os.remove(backup.pathname)
                         logger.verbose("Deleted %s in %s.", friendly_name, timer)
         if len(backups_to_preserve) == len(sorted_backups):
             logger.info("Nothing to do! (all backups preserved)")
-        return rotation_commands
+        return rotation_commands if location.is_remote else files_to_remove
 
     def load_config_file(self, location):
         """
@@ -642,7 +668,7 @@ class RotateBackups(PropertyManager):
         location = coerce_location(location)
         logger.info("Scanning %s for backups ..", location)
         location.ensure_readable(self.force)
-        for entry in natsort(location.context.list_entries(location.directory)):
+        for entry in natsort(location.list_entries()):
             match = self.timestamp_pattern.search(entry)
             if match:
                 if self.exclude_list and any(fnmatch.fnmatch(entry, p) for p in self.exclude_list):
@@ -818,6 +844,18 @@ class Location(PropertyManager):
     def is_remote(self):
         """:data:`True` if the location is remote, :data:`False` otherwise."""
         return isinstance(self.context, RemoteContext)
+    
+    @lazy_property
+    def is_windows(self):
+        """:data:`True` if local os is windows and context is local, :data:`False` otherwise."""
+        return (not self.is_remote) and os.name == 'nt'
+    
+    @lazy_property
+    def have_superuser_privileges(self):
+        """:data:`True` if superuser privileges available, :data:`False` otherwise."""
+        if self.is_windows:
+            return False # TODO: admin check for windows
+        return self.context.have_superuser_privileges
 
     @lazy_property
     def ssh_alias(self):
@@ -835,6 +873,11 @@ class Location(PropertyManager):
         :attr:`directory`.
         """
         return ['ssh_alias', 'directory'] if self.is_remote else ['directory']
+    
+    def list_entries(self):
+        if self.is_remote:
+            return self.context.list_entries(self.directory)
+        return os.listdir(self.directory)
 
     def ensure_exists(self, override=False):
         """
@@ -849,7 +892,7 @@ class Location(PropertyManager):
 
         .. seealso:: :func:`ensure_readable()`, :func:`ensure_writable()` and :func:`add_hints()`
         """
-        if self.context.is_directory(self.directory):
+        if (not self.is_remote and os.path.isdir(self.directory)) or self.context.is_directory(self.directory):
             logger.verbose("Confirmed that location exists: %s", self)
             return True
         elif override:
@@ -876,7 +919,7 @@ class Location(PropertyManager):
         # existence has been confirmed, to avoid multiple notices
         # about the same underlying problem.
         if self.ensure_exists(override):
-            if self.context.is_readable(self.directory):
+            if (not self.is_remote and  os.access(self.directory, os.X_OK)) or self.context.is_readable(self.directory):
                 logger.verbose("Confirmed that location is readable: %s", self)
                 return True
             elif override:
@@ -903,7 +946,7 @@ class Location(PropertyManager):
         # existence has been confirmed, to avoid multiple notices
         # about the same underlying problem.
         if self.ensure_exists(override):
-            if self.context.is_writable(self.directory):
+            if (not self.is_remote and  os.access(self.directory, os.W_OK)) or self.context.is_writable(self.directory):
                 logger.verbose("Confirmed that location is writable: %s", self)
                 return True
             elif override:
@@ -931,7 +974,7 @@ class Location(PropertyManager):
         .. seealso:: :func:`ensure_exists()`, :func:`ensure_readable()` and :func:`ensure_writable()`
         """
         sentences = [message]
-        if not self.context.have_superuser_privileges:
+        if not self.have_superuser_privileges:
             sentences.append("If filesystem permissions are the problem consider using the --use-sudo option.")
         sentences.append("To continue despite this failing sanity check you can use --force.")
         return " ".join(sentences)
